@@ -4,6 +4,13 @@
 " Date: 08/2019
 " License: MIT
 
+function! ShouldSync()
+    if empty(findfile('.vim-arsync', '.;'))
+        return 0
+    endif
+    return 1
+endfunction
+
 function! LoadConf()
     let l:conf_dict = {}
     let l:config_file = findfile('.vim-arsync', '.;')
@@ -12,7 +19,7 @@ function! LoadConf()
         let l:conf_options = readfile(l:config_file)
         for i in l:conf_options
             let l:var_name = substitute(i[0:stridx(i, ' ')], '^\s*\(.\{-}\)\s*$', '\1', '')
-            if l:var_name == 'ignore_path'
+            if l:var_name == 'ignore_path' || l:var_name == 'include_path'
                 let l:var_value = eval(substitute(i[stridx(i, ' '):], '^\s*\(.\{-}\)\s*$', '\1', ''))
                 " echo substitute(i[stridx(i, ' '):], '^\s*\(.\{-}\)\s*$', '\1', '')
             else
@@ -89,6 +96,13 @@ function! ARsync(direction)
                 let l:cmd = [ 'rsync', '-var',  l:conf_dict['local_path'] , l:conf_dict['remote_path'] . '/', '--delete']
             endif
         endif
+        if has_key(l:conf_dict, 'include_path')
+            echo l:conf_dict['include_path']
+            for file in l:conf_dict['include_path']
+                echo file
+                let l:cmd = l:cmd + ['--include', file]
+            endfor
+        endif
         if has_key(l:conf_dict, 'ignore_path')
             for file in l:conf_dict['ignore_path']
                 let l:cmd = l:cmd + ['--exclude', file]
@@ -119,16 +133,18 @@ function! ARsync(direction)
 endfunction
 
 function! AutoSync()
-    let l:conf_dict = LoadConf()
-    if has_key(l:conf_dict, 'auto_sync_up')
-        if l:conf_dict['auto_sync_up'] == 1
-            if has_key(l:conf_dict, 'sleep_before_sync')
-                let g:sleep_time = l:conf_dict['sleep_before_sync']*1000
-                autocmd BufWritePost,FileWritePost * call timer_start(g:sleep_time, { -> execute("call ARsync('up')", "")})
-            else
-                autocmd BufWritePost,FileWritePost * ARsyncUp
+    if ShouldSync()
+        let l:conf_dict = LoadConf()
+        if has_key(l:conf_dict, 'auto_sync_up')
+            if l:conf_dict['auto_sync_up'] == 1
+                if has_key(l:conf_dict, 'sleep_before_sync')
+                    let g:sleep_time = l:conf_dict['sleep_before_sync']*1000
+                    autocmd BufWritePost,FileWritePost * call timer_start(g:sleep_time, { -> execute("call ARsync('up')", "")})
+                else
+                    autocmd BufWritePost,FileWritePost * ARsyncUp
+                endif
+                " echo 'Setting up auto sync to remote'
             endif
-            " echo 'Setting up auto sync to remote'
         endif
     endif
 endfunction
