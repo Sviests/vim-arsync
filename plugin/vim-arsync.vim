@@ -5,10 +5,7 @@
 " License: MIT
 
 function! ShouldSync()
-    if empty(findfile('.vim-arsync', '.;'))
-        return 0
-    endif
-    return 1
+    return !empty(findfile('.vim-arsync', '.;'))
 endfunction
 
 function! LoadConf()
@@ -81,7 +78,7 @@ function! ARsync(direction)
         endif
         if l:conf_dict['remote_or_local'] == 'remote'
             if a:direction == 'down'
-                let l:cmd = [ 'rsync', '-vazre', 'ssh -p '.l:conf_dict['remote_port'], l:user_passwd . l:conf_dict['remote_host'] . ':' . l:conf_dict['remote_path'] . '/', l:conf_dict['local_path'] . '/']
+                let l:cmd = [ 'rsync', '--prune-empty-dirs', '-vazre', 'ssh -p '.l:conf_dict['remote_port'], l:user_passwd . l:conf_dict['remote_host'] . ':' . l:conf_dict['remote_path'] . '/', l:conf_dict['local_path'] . '/']
             elseif  a:direction == 'up'
                 let l:cmd = [ 'rsync', '-vazre', 'ssh -p '.l:conf_dict['remote_port'], l:conf_dict['local_path'] . '/', l:user_passwd . l:conf_dict['remote_host'] . ':' . l:conf_dict['remote_path'] . '/']
             else " updelete
@@ -97,9 +94,7 @@ function! ARsync(direction)
             endif
         endif
         if has_key(l:conf_dict, 'include_path')
-            echo l:conf_dict['include_path']
             for file in l:conf_dict['include_path']
-                echo file
                 let l:cmd = l:cmd + ['--include', file]
             endfor
         endif
