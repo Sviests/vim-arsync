@@ -4,20 +4,21 @@
 " Date: 08/2019
 " License: MIT
 
+function! ShouldSync()
+    return !empty(findfile('.vim-arsync', '.;'))
+endfunction
+
 function! LoadConf()
     let l:conf_dict = {}
-    let l:file_exists = filereadable('.vim-arsync')
+    let l:config_file = findfile('.vim-arsync', '.;')
 
-    if l:file_exists > 0
-        let l:conf_options = readfile('.vim-arsync')
+    if strlen(l:config_file) > 0
+        let l:conf_options = readfile(l:config_file)
         for i in l:conf_options
             let l:var_name = substitute(i[0:stridx(i, ' ')], '^\s*\(.\{-}\)\s*$', '\1', '')
-            if l:var_name == 'ignore_path'
+            if l:var_name == 'ignore_path' || l:var_name == 'include_path'
                 let l:var_value = eval(substitute(i[stridx(i, ' '):], '^\s*\(.\{-}\)\s*$', '\1', ''))
                 " echo substitute(i[stridx(i, ' '):], '^\s*\(.\{-}\)\s*$', '\1', '')
-            elseif l:var_name == 'remote_passwd'
-                " Do not escape characters in passwords.
-                let l:var_value = substitute(i[stridx(i, ' '):], '^\s*\(.\{-}\)\s*$', '\1', '')
             else
                 let l:var_value = escape(substitute(i[stridx(i, ' '):], '^\s*\(.\{-}\)\s*$', '\1', ''), '%#!')
             endif
@@ -25,7 +26,8 @@ function! LoadConf()
         endfor
     endif
     if !has_key(l:conf_dict, "local_path")
-        let l:conf_dict['local_path'] = getcwd()
+        " echom fnamemodify(l:config_file,':p:h')
+        let l:conf_dict['local_path'] = fnamemodify(l:config_file,':p:h')
     endif
     if !has_key(l:conf_dict, "remote_port")
         let l:conf_dict['remote_port'] = 22
@@ -82,20 +84,25 @@ function! ARsync(direction)
         endif
         if l:conf_dict['remote_or_local'] == 'remote'
             if a:direction == 'down'
-                let l:cmd = [ 'rsync', l:conf_dict['remote_options'], 'ssh -p '.l:conf_dict['remote_port'], l:user_passwd . l:conf_dict['remote_host'] . ':' . l:conf_dict['remote_path'] . '/', l:conf_dict['local_path'] . '/']
+                let l:cmd = [ 'rsync', '--prune-empty-dirs', '-vazre', 'ssh -p '.l:conf_dict['remote_port'], l:user_passwd . l:conf_dict['remote_host'] . ':' . l:conf_dict['remote_path'] . '/', l:conf_dict['local_path'] . '/']
             elseif  a:direction == 'up'
-                let l:cmd = [ 'rsync', l:conf_dict['remote_options'], 'ssh -p '.l:conf_dict['remote_port'], l:conf_dict['local_path'] . '/', l:user_passwd . l:conf_dict['remote_host'] . ':' . l:conf_dict['remote_path'] . '/']
+                let l:cmd = [ 'rsync', '-vazre', 'ssh -p '.l:conf_dict['remote_port'], l:conf_dict['local_path'] . '/', l:user_passwd . l:conf_dict['remote_host'] . ':' . l:conf_dict['remote_path'] . '/']
             else " updelete
-                let l:cmd = [ 'rsync', l:conf_dict['remote_options'], 'ssh -p '.l:conf_dict['remote_port'], l:conf_dict['local_path'] . '/', l:user_passwd . l:conf_dict['remote_host'] . ':' . l:conf_dict['remote_path'] . '/', '--delete']
+                let l:cmd = [ 'rsync', '-vazre', 'ssh -p '.l:conf_dict['remote_port'], l:conf_dict['local_path'] . '/', l:user_passwd . l:conf_dict['remote_host'] . ':' . l:conf_dict['remote_path'] . '/', '--delete']
             endif
         elseif l:conf_dict['remote_or_local'] == 'local'
             if a:direction == 'down'
-                let l:cmd = [ 'rsync', l:conf_dict['local_options'],  l:conf_dict['remote_path'] , l:conf_dict['local_path']]
+                let l:cmd = [ 'rsync', '-var',  l:conf_dict['remote_path'] , l:conf_dict['local_path']]
             elseif  a:direction == 'up'
-                let l:cmd = [ 'rsync', l:conf_dict['local_options'],  l:conf_dict['local_path'] , l:conf_dict['remote_path']]
+                let l:cmd = [ 'rsync', '-var',  l:conf_dict['local_path'] , l:conf_dict['remote_path']]
             else " updelete
-                let l:cmd = [ 'rsync', l:conf_dict['local_options'],  l:conf_dict['local_path'] , l:conf_dict['remote_path'] . '/', '--delete']
+                let l:cmd = [ 'rsync', '-var',  l:conf_dict['local_path'] , l:conf_dict['remote_path'] . '/', '--delete']
             endif
+        endif
+        if has_key(l:conf_dict, 'include_path')
+            for file in l:conf_dict['include_path']
+                let l:cmd = l:cmd + ['--include', file]
+            endfor
         endif
         if has_key(l:conf_dict, 'ignore_path')
             for file in l:conf_dict['ignore_path']
@@ -115,7 +122,7 @@ function! ARsync(direction)
         call setqflist([], ' ', {'title' : 'vim-arsync'})
         let g:qfid = getqflist({'id' : 0}).id
         " redraw | echom join(cmd)
-        let l:job_id = async#job#start(cmd, {
+        let l:job_id = arsync#job#start(cmd, {
                     \ 'on_stdout': function('JobHandler'),
                     \ 'on_stderr': function('JobHandler'),
                     \ 'on_exit': function('JobHandler'),
@@ -127,16 +134,18 @@ function! ARsync(direction)
 endfunction
 
 function! AutoSync()
-    let l:conf_dict = LoadConf()
-    if has_key(l:conf_dict, 'auto_sync_up')
-        if l:conf_dict['auto_sync_up'] == 1
-            if has_key(l:conf_dict, 'sleep_before_sync')
-                let g:sleep_time = l:conf_dict['sleep_before_sync']*1000
-                autocmd BufWritePost,FileWritePost * call timer_start(g:sleep_time, { -> execute("call ARsync('up')", "")})
-            else
-                autocmd BufWritePost,FileWritePost * ARsyncUp
+    if ShouldSync()
+        let l:conf_dict = LoadConf()
+        if has_key(l:conf_dict, 'auto_sync_up')
+            if l:conf_dict['auto_sync_up'] == 1
+                if has_key(l:conf_dict, 'sleep_before_sync')
+                    let g:sleep_time = l:conf_dict['sleep_before_sync']*1000
+                    autocmd BufWritePost,FileWritePost * call timer_start(g:sleep_time, { -> execute("call ARsync('up')", "")})
+                else
+                    autocmd BufWritePost,FileWritePost * ARsyncUp
+                endif
+                " echo 'Setting up auto sync to remote'
             endif
-            " echo 'Setting up auto sync to remote'
         endif
     endif
 endfunction

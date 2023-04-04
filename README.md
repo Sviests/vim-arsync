@@ -47,8 +47,14 @@ use {'kenn7/vim-arsync',
 ```vim
 :source %
 :PackerSync
-``` 
-    
+```
+    Plug 'kenn7/vim-arsync'
+
+... then run the following in Vim:
+
+    :source %
+    :PlugInstall
+
 ### Configuration
 Create a ```.vim-arsync``` file on the root of your project that contains the following:
 
@@ -56,7 +62,7 @@ Create a ```.vim-arsync``` file on the root of your project that contains the fo
 remote_host     example.com
 remote_user    john
 remote_port    22
-remote_passwd  secret 
+remote_passwd  secret
 remote_path     ~/temp/
 local_path    /home/ken/temp/vuetest/
 ignore_path     ["build/","test/"]
@@ -72,7 +78,7 @@ Required fields are:
 
 Optional fields are:
 - ```remote_user```    username to connect with
-- ```remote_passwd```  password to connect with (requires sshpass) (needed if not using ssh-keys) 
+- ```remote_passwd```  password to connect with (requires sshpass) (needed if not using ssh-keys)
 - ```remote_port```    remote ssh port to connect to (default is 22)
 - ```local_path```     local folder to be synced (defaults to folder of .vim-arsync)
 - ```ignore_path```    list of ingored files/folders
@@ -86,7 +92,9 @@ Optional fields are:
 **NOTE:**
 - fields can be commented out with ```#```
 - rsync will receive the flags `-varze` for remote syncing and `-var` for local syncing by default. Any flags you set using `rsync_flags` will override these flags.
-    
+
+NB: fields can be commented out with ```#```
+
 ## Usage
 If ```auto_sync_up``` is set to 1, the plugin will automatically launch the ```:ARsyncUP``` command
 everytime a buffer is saved.
@@ -119,3 +127,12 @@ This plugins uses the [async.vim](https://github.com/prabirshrestha/async.vim) l
 
 - [coffebar/transfer.nvim](https://github.com/coffebar/transfer.nvim)
 - [OscarCreator/rsync.nvim](https://github.com/OscarCreator/rsync.nvim)
+- [ ] handle -u (update) feature of rsync ?
+- [ ] deactivate auto sync on error
+- [ ] better handle comments in conf file
+
+## Acknoledgements
+
+This plugin was inspired by [vim-hsftp](https://github.com/hesselbom/vim-hsftp) but vim-arsync offers more (rsync, ignore, async...).
+
+This plugins ships with the [async.vim](https://github.com/prabirshrestha/async.vim) library for async operation with vim and neovim.
