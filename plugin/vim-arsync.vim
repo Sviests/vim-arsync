@@ -35,6 +35,12 @@ function! LoadConf()
     if !has_key(l:conf_dict, "remote_or_local")
         let l:conf_dict['remote_or_local'] = "remote"
     endif
+    if !has_key(l:conf_dict, "local_options")
+        let l:conf_dict['local_options'] = "-var"
+    endif
+    if !has_key(l:conf_dict, "remote_options")
+        let l:conf_dict['remote_options'] = "-vazre"
+    endif
     return l:conf_dict
 endfunction
 
