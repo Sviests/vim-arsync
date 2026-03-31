@@ -3,7 +3,7 @@ vim plugin for asynchronous synchronisation of remote files and local files usin
 
 ## Main features
 - sync up or down project folder using rsync (with compression options etc. -> -avzhe ssh )
-- ignore certains files or folder based on configuration file
+- ignore certain files or folders based on configuration file
 - asynchronous operation
 - project based configuration file
 - auto sync up on file save
@@ -19,11 +19,10 @@ vim plugin for asynchronous synchronisation of remote files and local files usin
 ### Using vim-plug
 Place this in your .vimrc:
 
+```vim
 Plug 'kenn7/vim-arsync'
-
-" vim-arsync depedencies
-Plug 'prabirshrestha/async.vim'
 ```
+
 ... then run the following in Vim:
 
 ```vim
@@ -34,11 +33,7 @@ Plug 'prabirshrestha/async.vim'
 ### Using Packer
 
 ```lua
-use {'kenn7/vim-arsync',
-    requires = {
-        {'prabirshrestha/async.vim'}
-    }
-}
+use { 'kenn7/vim-arsync' }
 ```
 
 ... then run the following in Vim:
@@ -47,16 +42,17 @@ use {'kenn7/vim-arsync',
 :source %
 :PackerSync
 ```
+
 ### Configuration
 Create a ```.vim-arsync``` file on the root of your project that contains the following:
 
 ```
 remote_host     example.com
-remote_user    john
-remote_port    22
-remote_passwd  secret
+remote_user     john
+remote_port     22
+remote_passwd   secret
 remote_path     ~/temp/
-local_path    /home/ken/temp/vuetest/
+local_path      /home/ken/temp/vuetest/
 ignore_path     ["build/","test/"]
 ignore_dotfiles 1
 auto_sync_up    0
@@ -69,62 +65,56 @@ Required fields are:
 - ```remote_path```     remote folder to be synced
 
 Optional fields are:
-- ```remote_user```    username to connect with
-- ```remote_passwd```  password to connect with (requires sshpass) (needed if not using ssh-keys)
-- ```remote_port```    remote ssh port to connect to (default is 22)
-- ```local_path```     local folder to be synced (defaults to folder of .vim-arsync)
-- ```ignore_path```    list of ingored files/folders
-- ```ignore_dotfiles``` set to 1 to not sync dotfiles (e.g. .vim-arsync)
-- ```auto_sync_up```   set to 1 for activating automatic upload syncing on file save
-- ```remote_or_local``` set to 'local' if you want to perform syncing localy
-- ```sleep_before_sync```   set to x seconds if you want to sleep before sync(like compiling a file before syncing)
-- ```local_options``` overrides the default rsync options for case where `remote_or_local` is local
-- ```remote_options``` overrides the default rsync options for case where `remote_or_local` is remote
+- ```remote_user```     username to connect with
+- ```remote_passwd```   password to connect with (requires sshpass) (not needed with SSH keys)
+- ```remote_port```     remote SSH port (default: 22)
+- ```local_path```      local folder to be synced (defaults to the directory containing `.vim-arsync`)
+- ```ignore_path```     list of ignored files/folders e.g. `["build/","test/"]`
+- ```ignore_dotfiles``` set to 1 to exclude dotfiles (e.g. `.vim-arsync` itself)
+- ```auto_sync_up```    set to 1 to automatically upload on every file save
+- ```remote_or_local``` set to `local` to sync between two local filesystem paths instead of over SSH
+- ```sleep_before_sync``` delay in seconds before syncing — must be a positive integer (e.g. to wait for a build to finish); `0` or unset means sync immediately
+- ```local_options```   overrides the default rsync flags used when `remote_or_local` is `local` (default: `-var`)
+- ```remote_options```  overrides the default rsync flags used when `remote_or_local` is `remote` (default: `-vazr`; do **not** include `-e` as it is added automatically). To pass custom SSH options (e.g. identity file, ciphers), configure the host in `~/.ssh/config` instead.
 
-**NOTE:**
-- fields can be commented out with ```#```
-- rsync will receive the flags `-varze` for remote syncing and `-var` for local syncing by default. Any flags you set using `rsync_flags` will override these flags.
-
-NB: fields can be commented out with ```#```
+**Notes:**
+- Lines starting with `#` are treated as comments and ignored.
+- Blank lines are ignored.
+- For remote syncing, `-e 'ssh -p PORT'` is always added automatically — do not include `-e` in `remote_options`.
 
 ## Usage
-If ```auto_sync_up``` is set to 1, the plugin will automatically launch the ```:ARsyncUP``` command
-everytime a buffer is saved.
-
-Setting ```rsync_flags``` to include `-ul`, for example, will use rsync's 'update' feature and will also copy over symlinks. Check out rsync's man page to see all the options it supports.
+If ```auto_sync_up``` is set to 1, the plugin will automatically run `:ARsyncUp` every time a
+buffer is saved. The auto-sync hook is registered exactly once per project/directory, so opening
+many buffers will not cause repeated or duplicated syncs.
 
 ### Commands
 
-- ```:ARshowConf``` shows detected configuration
-- ```:ARsyncUp``` Syncs files up to the remote (upload local to remote)
-- ```:ARsyncUpDelete``` Syncs files up to the remote (upload local to remote)
-  and delete remote files not existing on local (be careful with that)
-- ```:ARsyncDown``` Syncs files down from the remote (download remote to local)
+- ```:ARshowConf``` shows the detected configuration for the current project
+- ```:ARsyncUp``` uploads local files to the remote
+- ```:ARsyncUpDelete``` uploads local files to the remote and **deletes remote files** that do not exist locally (use with care)
+- ```:ARsyncDown``` downloads remote files to local
+- ```:ARsyncDownDelete``` downloads remote files to local and **deletes local files** that do not exist on the remote — use this to fully mirror the remote and clean the local project state
 
-Commands can be mapped to keyboard shortcuts enhance operations
+Commands can be mapped to keyboard shortcuts to enhance operations:
+
+```vim
+nnoremap <leader>su :ARsyncUp<CR>
+nnoremap <leader>sd :ARsyncDown<CR>
+nnoremap <leader>sD :ARsyncDownDelete<CR>
+```
 
 ## TODO
 
 - [ ] run more tests
 - [ ] deactivate auto sync on error
-- [ ] better handle comments in conf file
 
 ## Acknowledgements
 
 This plugin was inspired by [vim-hsftp](https://github.com/hesselbom/vim-hsftp) but vim-arsync offers more (rsync, ignore, async...).
 
-This plugins uses the [async.vim](https://github.com/prabirshrestha/async.vim) library for async operation with vim and neovim.
+This plugin ships with the [async.vim](https://github.com/prabirshrestha/async.vim) library for async operation with vim and neovim.
 
 ## Similar projects
 
 - [coffebar/transfer.nvim](https://github.com/coffebar/transfer.nvim)
 - [OscarCreator/rsync.nvim](https://github.com/OscarCreator/rsync.nvim)
-- [ ] handle -u (update) feature of rsync ?
-- [ ] deactivate auto sync on error
-- [ ] better handle comments in conf file
-
-## Acknoledgements
-
-This plugin was inspired by [vim-hsftp](https://github.com/hesselbom/vim-hsftp) but vim-arsync offers more (rsync, ignore, async...).
-
-This plugins ships with the [async.vim](https://github.com/prabirshrestha/async.vim) library for async operation with vim and neovim.
