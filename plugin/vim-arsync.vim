@@ -298,7 +298,7 @@ function! ARsync(direction) abort
                 \ && !empty(l:conf_dict['post_sync_cmd'])
         let l:user_at_host = (has_key(l:conf_dict, 'remote_user')
                     \ ? l:conf_dict['remote_user'] . '@' : '') . l:conf_dict['remote_host']
-        let s:arsync_post_job_cmd = ['ssh', '-p', '' . l:conf_dict['remote_port'],
+        let s:arsync_post_job_cmd = ['ssh', '-p', string(l:conf_dict['remote_port']),
                     \ l:user_at_host, l:conf_dict['post_sync_cmd']]
     endif
 
@@ -339,7 +339,7 @@ function! ARgitStatus() abort
     let l:remote_shell_cmd = l:git_base . ' log --oneline -5 2>/dev/null'
                 \ . '; echo "---"'
                 \ . '; ' . l:git_base . ' status --short 2>/dev/null'
-    let l:ssh_cmd = ['ssh', '-p', '' . l:conf_dict['remote_port'],
+    let l:ssh_cmd = ['ssh', '-p', string(l:conf_dict['remote_port']),
                 \ l:user_at_host, l:remote_shell_cmd]
 
     call setqflist([], ' ', {'title' : 'vim-arsync: git @ ' . l:user_at_host . ':' . l:remote_path})
