@@ -1,5 +1,10 @@
 # vim-arsync :octopus:
-vim plugin for asynchronous synchronisation of remote files and local files using rsync
+Personal fork of `kenn7/vim-arsync`, maintained in `jenkeeri/vim-arsync`, for asynchronous rsync-based synchronization between local and remote project files.
+
+## Fork notes
+- Installation examples in this README use this fork: `jenkeeri/vim-arsync`.
+- This fork includes support for `ARsyncDownDelete`, `sleep_before_sync`, `local_options`, `remote_options`, and `remote_or_local` syncing modes.
+- Config parsing ignores blank lines and `#` comments in `.vim-arsync`.
 
 ## Main features
 - sync up or down project folder using rsync (with compression options etc. -> -avzhe ssh )
@@ -20,7 +25,7 @@ vim plugin for asynchronous synchronisation of remote files and local files usin
 Place this in your .vimrc:
 
 ```vim
-Plug 'kenn7/vim-arsync'
+Plug 'jenkeeri/vim-arsync'
 ```
 
 ... then run the following in Vim:
@@ -33,7 +38,7 @@ Plug 'kenn7/vim-arsync'
 ### Using Packer
 
 ```lua
-use { 'kenn7/vim-arsync' }
+use { 'jenkeeri/vim-arsync' }
 ```
 
 ... then run the following in Vim:
@@ -53,6 +58,7 @@ remote_port     22
 remote_passwd   secret
 remote_path     ~/temp/
 local_path      /home/ken/temp/vuetest/
+include_path    ["src/**","package.json"]
 ignore_path     ["build/","test/"]
 ignore_dotfiles 1
 auto_sync_up    0
@@ -70,6 +76,7 @@ Optional fields are:
 - ```remote_port```     remote SSH port (default: 22)
 - ```local_path```      local folder to be synced (defaults to the directory containing `.vim-arsync`)
 - ```ignore_path```     list of ignored files/folders e.g. `["build/","test/"]`
+- ```include_path```    list of included files/folders e.g. `["src/**","package.json"]` (passed as `--include`)
 - ```ignore_dotfiles``` set to 1 to exclude dotfiles (e.g. `.vim-arsync` itself)
 - ```auto_sync_up```    set to 1 to automatically upload on every file save
 - ```remote_or_local``` set to `local` to sync between two local filesystem paths instead of over SSH
