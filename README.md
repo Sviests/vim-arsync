@@ -5,14 +5,21 @@ Personal fork of `kenn7/vim-arsync`, maintained in `jenkeeri/vim-arsync`, for as
 - Installation examples in this README use this fork: `jenkeeri/vim-arsync`.
 - This fork includes support for `ARsyncDownDelete`, `sleep_before_sync`, `local_options`, `remote_options`, and `remote_or_local` syncing modes.
 - Config parsing ignores blank lines and `#` comments in `.vim-arsync`.
+- Multiple sync profiles, per-file/dir sync, post-sync remote command, Git status query, and statusline integration.
 
 ## Main features
-- sync up or down project folder using rsync (with compression options etc. -> -avzhe ssh )
+- sync up or down project folder using rsync (with compression options etc. -> -avzhe ssh)
 - ignore certain files or folders based on configuration file
 - asynchronous operation
 - project based configuration file
-- auto sync up on file save
+- auto sync up on file save with optional debounce
 - works with ssh-keys (recommended) or plaintext password in config file
+- run a remote build command after every up-sync and see compiler errors in the quickfix list
+- dry-run preview before any destructive sync
+- query remote git log and status without touching `.git/`
+- per-file and per-directory sync for large projects
+- multiple named profiles (e.g. `.vim-arsync.debug`, `.vim-arsync.release`)
+- statusline integration via `g:arsync_status` and `g:arsync_last_sync_time`
 
 ## Installation
 ### Dependencies
@@ -61,9 +68,13 @@ local_path      /home/ken/temp/vuetest/
 include_path    ["src/**","package.json"]
 ignore_path     ["build/","test/"]
 ignore_dotfiles 1
+ignore_git      1
 auto_sync_up    0
+debounce_ms     500
 remote_or_local remote
 sleep_before_sync 0
+post_sync_cmd   make -C ~/temp/build -j8
+warn_on_down    0
 ```
 
 Required fields are:
@@ -78,29 +89,42 @@ Optional fields are:
 - ```ignore_path```     list of ignored files/folders e.g. `["build/","test/"]`
 - ```include_path```    list of included files/folders e.g. `["src/**","package.json"]` (passed as `--include`)
 - ```ignore_dotfiles``` set to 1 to exclude dotfiles (e.g. `.vim-arsync` itself)
+- ```ignore_git```      set to 1 to exclude `.git/` — prevents the remote's Git history from overwriting the local repo (more surgical than `ignore_dotfiles`, which also hides `.clang-format`, `.clangd`, etc.)
 - ```auto_sync_up```    set to 1 to automatically upload on every file save
+- ```debounce_ms```     when `auto_sync_up` is enabled, coalesce rapid saves — the timer resets on each write and rsync only fires once the editing burst ends (e.g. `500` for 500 ms); takes precedence over `sleep_before_sync`
 - ```remote_or_local``` set to `local` to sync between two local filesystem paths instead of over SSH
 - ```sleep_before_sync``` delay in seconds before syncing — must be a positive integer (e.g. to wait for a build to finish); `0` or unset means sync immediately
 - ```local_options```   overrides the default rsync flags used when `remote_or_local` is `local` (default: `-var`)
 - ```remote_options```  overrides the default rsync flags used when `remote_or_local` is `remote` (default: `-vazr`; do **not** include `-e` as it is added automatically). To pass custom SSH options (e.g. identity file, ciphers), configure the host in `~/.ssh/config` instead.
+- ```post_sync_cmd```   shell command run on the **remote host** via SSH after every successful up-sync. Output is piped into the quickfix list so compiler errors are immediately navigable. Example: `make -C ~/project/build -j8` or `ninja -C build/`. Only applies to remote mode.
+- ```warn_on_down```    set to 1 to require interactive confirmation before any down-sync (`ARsyncDown` / `ARsyncDownDelete`)
 
 **Notes:**
 - Lines starting with `#` are treated as comments and ignored.
 - Blank lines are ignored.
 - For remote syncing, `-e 'ssh -p PORT'` is always added automatically — do not include `-e` in `remote_options`.
+- `ignore_git` and `ignore_dotfiles` can be combined: `ignore_git 1` protects `.git/` while still allowing `.clang-format`, `.clangd`, etc. to sync.
 
 ## Usage
 If ```auto_sync_up``` is set to 1, the plugin will automatically run `:ARsyncUp` every time a
 buffer is saved. The auto-sync hook is registered exactly once per project/directory, so opening
 many buffers will not cause repeated or duplicated syncs.
 
+Use `debounce_ms` to avoid firing rsync on every keystroke-triggered save when working with
+tools like auto-save plugins or when running `:bufdo`.
+
 ### Commands
 
-- ```:ARshowConf``` shows the detected configuration for the current project
+- ```:ARshowConf``` shows the detected configuration and the resolved rsync command for the current project
 - ```:ARsyncUp``` uploads local files to the remote
 - ```:ARsyncUpDelete``` uploads local files to the remote and **deletes remote files** that do not exist locally (use with care)
 - ```:ARsyncDown``` downloads remote files to local
 - ```:ARsyncDownDelete``` downloads remote files to local and **deletes local files** that do not exist on the remote — use this to fully mirror the remote and clean the local project state
+- ```:ARsyncDryRun``` runs rsync with `--dry-run --itemize-changes` and shows exactly which files *would* be transferred — safe to run at any time
+- ```:ARsyncFile``` uploads only the file in the current buffer
+- ```:ARsyncDir``` uploads only the directory containing the current buffer
+- ```:ARgitStatus``` SSHs to the remote and shows `git log --oneline -5` and `git status --short` in the quickfix window — no files are transferred
+- ```:ARsyncProfile <name>``` switches the active profile (reads `.vim-arsync.<name>` instead of `.vim-arsync`); pass an empty string to revert to the default
 
 Commands can be mapped to keyboard shortcuts to enhance operations:
 
@@ -108,6 +132,42 @@ Commands can be mapped to keyboard shortcuts to enhance operations:
 nnoremap <leader>su :ARsyncUp<CR>
 nnoremap <leader>sd :ARsyncDown<CR>
 nnoremap <leader>sD :ARsyncDownDelete<CR>
+nnoremap <leader>sf :ARsyncFile<CR>
+nnoremap <leader>sr :ARsyncDryRun<CR>
+nnoremap <leader>sg :ARgitStatus<CR>
+```
+
+### Statusline integration
+
+The plugin updates two global variables after every sync:
+
+| Variable | Values |
+|---|---|
+| `g:arsync_status` | `''` (idle), `'syncing'`, `'ok'`, `'error'` |
+| `g:arsync_last_sync_time` | last successful sync time as `HH:MM:SS`, or `''` |
+
+Example for **lualine**:
+
+```lua
+sections = {
+  lualine_x = {
+    { function() return vim.g.arsync_status == 'syncing' and '⟳ syncing'
+                     or vim.g.arsync_status == 'ok'      and '✓ ' .. (vim.g.arsync_last_sync_time or '')
+                     or vim.g.arsync_status == 'error'   and '✗ sync error'
+                     or '' end },
+  },
+}
+```
+
+### Multiple profiles
+
+Create `.vim-arsync.debug` and `.vim-arsync.release` in your project root with different
+`remote_path` or `post_sync_cmd` values, then switch at runtime:
+
+```vim
+:ARsyncProfile debug
+:ARsyncProfile release
+:ARsyncProfile          " revert to default .vim-arsync
 ```
 
 ## TODO

@@ -9,13 +9,52 @@ if exists('g:loaded_vim_arsync')
 endif
 let g:loaded_vim_arsync = 1
 
-function! ShouldSync()
-    return !empty(findfile('.vim-arsync', '.;'))
+" ---------- Script-local state ----------
+let s:arsync_running        = 0   " concurrency guard
+let s:arsync_qfid           = 0   " quickfix list id for sync output
+let s:git_status_qfid       = 0   " quickfix list id for :ARgitStatus
+let s:arsync_debounce_timer = -1  " timer id for debounce
+let s:arsync_post_job_cmd   = []  " SSH command to run after a successful up-sync
+let s:arsync_is_dry_run     = 0   " 1 when the current job is a dry-run
+
+" Public variables for statusline / notification integration.
+" Possible values: '' (idle), 'syncing', 'ok', 'error'
+let g:arsync_status         = ''
+let g:arsync_last_sync_time = ''
+
+" ---------- Helpers ----------
+
+" Safe list parser — replaces eval() on ignore_path / include_path.
+" Accepts JSON-array syntax: ["a","b","c"]
+function! s:ParseList(raw) abort
+    try
+        let l:result = json_decode(a:raw)
+        if type(l:result) == type([])
+            return l:result
+        endif
+    catch
+    endtry
+    return []
 endfunction
 
-function! LoadConf()
+" Returns 1 when a .vim-arsync (or profile) config exists in the directory tree.
+function! ShouldSync() abort
+    let l:suffix = exists('g:arsync_profile') && !empty(g:arsync_profile)
+                \ ? '.' . g:arsync_profile : ''
+    return !empty(findfile('.vim-arsync' . l:suffix, '.;'))
+                \ || !empty(findfile('.vim-arsync', '.;'))
+endfunction
+
+" Parse and return the config dict from .vim-arsync (or active profile file).
+function! LoadConf() abort
     let l:conf_dict = {}
-    let l:config_file = findfile('.vim-arsync', '.;')
+    let l:suffix = exists('g:arsync_profile') && !empty(g:arsync_profile)
+                \ ? '.' . g:arsync_profile : ''
+    let l:config_file = findfile('.vim-arsync' . l:suffix, '.;')
+    " Fall back to the default config file when the profile file is not found
+    if empty(l:config_file) && !empty(l:suffix)
+        let l:config_file = findfile('.vim-arsync', '.;')
+    endif
 
     if strlen(l:config_file) > 0
         let l:conf_options = readfile(l:config_file)
@@ -30,10 +69,10 @@ function! LoadConf()
             if l:sep <= 0
                 continue
             endif
-            let l:var_name = l:trimmed[0:l:sep-1]
+            let l:var_name  = l:trimmed[0:l:sep-1]
             let l:raw_value = substitute(l:trimmed[l:sep+1:], '^\s*\(.\{-}\)\s*$', '\1', '')
             if l:var_name ==# 'ignore_path' || l:var_name ==# 'include_path'
-                let l:var_value = eval(l:raw_value)
+                let l:var_value = s:ParseList(l:raw_value)
             else
                 let l:var_value = escape(l:raw_value, '%#!')
             endif
@@ -58,32 +97,164 @@ function! LoadConf()
     return l:conf_dict
 endfunction
 
-function! JobHandler(job_id, data, event_type)
+" Build and return the rsync command list for the given direction using conf_dict.
+" Applies all filter flags (include_path, ignore_path, ignore_dotfiles, ignore_git, sshpass).
+" Returns [] for unknown direction/mode combinations.
+function! s:BuildRsyncCmd(direction, conf_dict) abort
+    let l:remote_opts = split(a:conf_dict['remote_options'])
+    let l:local_opts  = split(a:conf_dict['local_options'])
+    let l:ssh_cmd     = 'ssh -p ' . a:conf_dict['remote_port']
+    let l:user_passwd = has_key(a:conf_dict, 'remote_user')
+                \ ? a:conf_dict['remote_user'] . '@' : ''
+    let l:remote = has_key(a:conf_dict, 'remote_host')
+                \ ? l:user_passwd . a:conf_dict['remote_host'] . ':' . a:conf_dict['remote_path']
+                \ : ''
+
+    let l:cmd = []
+    if a:conf_dict['remote_or_local'] ==# 'remote'
+        if a:direction ==# 'down'
+            let l:cmd = ['rsync', '--prune-empty-dirs'] + l:remote_opts + ['-e', l:ssh_cmd, l:remote . '/', a:conf_dict['local_path'] . '/']
+        elseif a:direction ==# 'up'
+            let l:cmd = ['rsync'] + l:remote_opts + ['-e', l:ssh_cmd, a:conf_dict['local_path'] . '/', l:remote . '/']
+        elseif a:direction ==# 'upDelete'
+            let l:cmd = ['rsync', '--delete'] + l:remote_opts + ['-e', l:ssh_cmd, a:conf_dict['local_path'] . '/', l:remote . '/']
+        elseif a:direction ==# 'downDelete'
+            let l:cmd = ['rsync', '--delete', '--prune-empty-dirs'] + l:remote_opts + ['-e', l:ssh_cmd, l:remote . '/', a:conf_dict['local_path'] . '/']
+        elseif a:direction ==# 'dryRun'
+            let l:cmd = ['rsync', '--dry-run', '--itemize-changes'] + l:remote_opts + ['-e', l:ssh_cmd, a:conf_dict['local_path'] . '/', l:remote . '/']
+        endif
+    elseif a:conf_dict['remote_or_local'] ==# 'local'
+        if a:direction ==# 'down'
+            let l:cmd = ['rsync'] + l:local_opts + [a:conf_dict['remote_path'], a:conf_dict['local_path']]
+        elseif a:direction ==# 'up'
+            let l:cmd = ['rsync'] + l:local_opts + [a:conf_dict['local_path'], a:conf_dict['remote_path']]
+        elseif a:direction ==# 'upDelete'
+            let l:cmd = ['rsync', '--delete'] + l:local_opts + [a:conf_dict['local_path'], a:conf_dict['remote_path'] . '/']
+        elseif a:direction ==# 'downDelete'
+            let l:cmd = ['rsync', '--delete'] + l:local_opts + [a:conf_dict['remote_path'], a:conf_dict['local_path'] . '/']
+        elseif a:direction ==# 'dryRun'
+            let l:cmd = ['rsync', '--dry-run', '--itemize-changes'] + l:local_opts + [a:conf_dict['local_path'], a:conf_dict['remote_path']]
+        endif
+    endif
+
+    if empty(l:cmd)
+        return []
+    endif
+
+    if has_key(a:conf_dict, 'include_path')
+        for l:file in a:conf_dict['include_path']
+            let l:cmd += ['--include', l:file]
+        endfor
+    endif
+    if has_key(a:conf_dict, 'ignore_path')
+        for l:file in a:conf_dict['ignore_path']
+            let l:cmd += ['--exclude', l:file]
+        endfor
+    endif
+    if has_key(a:conf_dict, 'ignore_dotfiles') && a:conf_dict['ignore_dotfiles'] == 1
+        let l:cmd += ['--exclude', '.*']
+    endif
+    " ignore_git excludes .git/ without touching other dotfiles like .clang-format
+    if has_key(a:conf_dict, 'ignore_git') && a:conf_dict['ignore_git'] == 1
+        let l:cmd += ['--exclude', '.git/']
+    endif
+
+    if has_key(a:conf_dict, 'remote_passwd')
+        let l:cmd = ['sshpass', '-p', a:conf_dict['remote_passwd']] + l:cmd
+    endif
+
+    return l:cmd
+endfunction
+
+" ---------- Job handlers ----------
+
+function! JobHandler(job_id, data, event_type) abort
     if a:event_type ==# 'stdout' || a:event_type ==# 'stderr'
-        if has_key(getqflist({'id' : g:arsync_qfid}), 'id')
-            call setqflist([], 'a', {'id' : g:arsync_qfid, 'lines' : a:data})
+        if has_key(getqflist({'id' : s:arsync_qfid}), 'id')
+            call setqflist([], 'a', {'id' : s:arsync_qfid, 'lines' : a:data})
         endif
     elseif a:event_type ==# 'exit'
+        let s:arsync_running = 0
         if a:data != 0
+            let g:arsync_status = 'error'
+            copen
+        elseif s:arsync_is_dry_run
+            let g:arsync_status = 'ok'
+            echo 'vim-arsync: dry-run completed — see quickfix for changes.'
             copen
         else
-            echo 'vim-arsync: sync completed successfully.'
+            let g:arsync_status = 'ok'
+            let g:arsync_last_sync_time = strftime('%H:%M:%S')
+            if !empty(s:arsync_post_job_cmd)
+                call setqflist([], 'a', {'id' : s:arsync_qfid,
+                            \ 'lines' : ['', '--- post_sync_cmd ---']})
+                call arsync#job#start(s:arsync_post_job_cmd, {
+                            \ 'on_stdout': function('s:PostSyncHandler'),
+                            \ 'on_stderr': function('s:PostSyncHandler'),
+                            \ 'on_exit':   function('s:PostSyncHandler'),
+                            \ })
+            else
+                echo 'vim-arsync: sync completed successfully.'
+            endif
         endif
     endif
 endfunction
 
-function! ShowConf()
+" Handler for the post_sync_cmd SSH job that runs after a successful up-sync.
+function! s:PostSyncHandler(job_id, data, event_type) abort
+    if a:event_type ==# 'stdout' || a:event_type ==# 'stderr'
+        if has_key(getqflist({'id' : s:arsync_qfid}), 'id')
+            call setqflist([], 'a', {'id' : s:arsync_qfid, 'lines' : a:data})
+        endif
+    elseif a:event_type ==# 'exit'
+        if a:data != 0
+            echo 'vim-arsync: post_sync_cmd failed (exit ' . a:data . ') — see quickfix.'
+            copen
+        else
+            echo 'vim-arsync: sync and post_sync_cmd completed successfully.'
+        endif
+    endif
+endfunction
+
+" Handler for :ARgitStatus SSH query (uses a separate QF list).
+function! s:GitStatusHandler(job_id, data, event_type) abort
+    if a:event_type ==# 'stdout' || a:event_type ==# 'stderr'
+        if has_key(getqflist({'id' : s:git_status_qfid}), 'id')
+            call setqflist([], 'a', {'id' : s:git_status_qfid, 'lines' : a:data})
+        endif
+    elseif a:event_type ==# 'exit'
+        copen
+        if a:data != 0
+            echo 'vim-arsync: git status query failed (exit ' . a:data . ').'
+        endif
+    endif
+endfunction
+
+" ---------- Core functions ----------
+
+" Pretty-print the current configuration and the resolved rsync command.
+function! ShowConf() abort
     if !ShouldSync()
         echoerr 'vim-arsync: No .vim-arsync config file found in this directory tree.'
         return
     endif
     let l:conf_dict = LoadConf()
-    echo l:conf_dict
+    echo '=== vim-arsync configuration ==='
+    for l:item in sort(items(l:conf_dict))
+        echo printf('  %-22s = %s', l:item[0], string(l:item[1]))
+    endfor
+    if has_key(l:conf_dict, 'remote_host') || l:conf_dict['remote_or_local'] ==# 'local'
+        echo ''
+        echo '=== Resolved rsync command (up) ==='
+        let l:cmd = s:BuildRsyncCmd('up', l:conf_dict)
+        echo '  ' . join(map(copy(l:cmd), 'shellescape(v:val)'), ' ')
+    endif
 endfunction
 
-function! ARsync(direction)
+" Main sync entry point. direction: 'up', 'down', 'upDelete', 'downDelete', 'dryRun'.
+function! ARsync(direction) abort
     let l:conf_dict = LoadConf()
-    if !has_key(l:conf_dict, 'remote_host')
+    if l:conf_dict['remote_or_local'] ==# 'remote' && !has_key(l:conf_dict, 'remote_host')
         if empty(findfile('.vim-arsync', '.;'))
             echoerr 'vim-arsync: No .vim-arsync config file found. Aborting...'
         else
@@ -92,72 +263,247 @@ function! ARsync(direction)
         return
     endif
 
-    let l:user_passwd = ''
-    if has_key(l:conf_dict, 'remote_user')
-        let l:user_passwd = l:conf_dict['remote_user'] . '@'
+    if s:arsync_running
+        echo 'vim-arsync: sync already in progress, skipping.'
+        return
     endif
-    if has_key(l:conf_dict, 'remote_passwd')
-        if !executable('sshpass')
-            echoerr 'vim-arsync: sshpass is required for plain-text password auth. Install sshpass or use SSH key auth.'
+
+    if has_key(l:conf_dict, 'remote_passwd') && !executable('sshpass')
+        echoerr 'vim-arsync: sshpass is required for plain-text password auth. Install sshpass or use SSH key auth.'
+        return
+    endif
+
+    " Confirmation prompt before destructive down-syncs when warn_on_down = 1
+    if (a:direction ==# 'down' || a:direction ==# 'downDelete')
+                \ && has_key(l:conf_dict, 'warn_on_down') && l:conf_dict['warn_on_down'] == 1
+        let l:answer = input('vim-arsync: This will overwrite local files. Proceed? (y/N) ')
+        echo ''
+        if l:answer !~# '^[yY]'
+            echo 'vim-arsync: Down-sync cancelled.'
             return
         endif
-        let l:sshpass_passwd = l:conf_dict['remote_passwd']
     endif
 
-    let l:remote_opts = split(l:conf_dict['remote_options'])
-    let l:local_opts = split(l:conf_dict['local_options'])
-    let l:ssh_cmd = 'ssh -p ' . l:conf_dict['remote_port']
-    let l:remote = l:user_passwd . l:conf_dict['remote_host'] . ':' . l:conf_dict['remote_path']
-
-    if l:conf_dict['remote_or_local'] ==# 'remote'
-        if a:direction ==# 'down'
-            let l:cmd = ['rsync', '--prune-empty-dirs'] + l:remote_opts + ['-e', l:ssh_cmd, l:remote . '/', l:conf_dict['local_path'] . '/']
-        elseif a:direction ==# 'up'
-            let l:cmd = ['rsync'] + l:remote_opts + ['-e', l:ssh_cmd, l:conf_dict['local_path'] . '/', l:remote . '/']
-        elseif a:direction ==# 'upDelete'
-            let l:cmd = ['rsync', '--delete'] + l:remote_opts + ['-e', l:ssh_cmd, l:conf_dict['local_path'] . '/', l:remote . '/']
-        elseif a:direction ==# 'downDelete'
-            let l:cmd = ['rsync', '--delete', '--prune-empty-dirs'] + l:remote_opts + ['-e', l:ssh_cmd, l:remote . '/', l:conf_dict['local_path'] . '/']
-        endif
-    elseif l:conf_dict['remote_or_local'] ==# 'local'
-        if a:direction ==# 'down'
-            let l:cmd = ['rsync'] + l:local_opts + [l:conf_dict['remote_path'], l:conf_dict['local_path']]
-        elseif a:direction ==# 'up'
-            let l:cmd = ['rsync'] + l:local_opts + [l:conf_dict['local_path'], l:conf_dict['remote_path']]
-        elseif a:direction ==# 'upDelete'
-            let l:cmd = ['rsync', '--delete'] + l:local_opts + [l:conf_dict['local_path'], l:conf_dict['remote_path'] . '/']
-        elseif a:direction ==# 'downDelete'
-            let l:cmd = ['rsync', '--delete'] + l:local_opts + [l:conf_dict['remote_path'], l:conf_dict['local_path'] . '/']
-        endif
+    let l:cmd = s:BuildRsyncCmd(a:direction, l:conf_dict)
+    if empty(l:cmd)
+        echoerr 'vim-arsync: Unknown sync direction or mode: ' . a:direction
+        return
     endif
 
-    if has_key(l:conf_dict, 'include_path')
-        for file in l:conf_dict['include_path']
-            let l:cmd = l:cmd + ['--include', file]
-        endfor
-    endif
-    if has_key(l:conf_dict, 'ignore_path')
-        for file in l:conf_dict['ignore_path']
-            let l:cmd = l:cmd + ['--exclude', file]
-        endfor
-    endif
-    if has_key(l:conf_dict, 'ignore_dotfiles') && l:conf_dict['ignore_dotfiles'] == 1
-        let l:cmd = l:cmd + ['--exclude', '.*']
-    endif
-    if has_key(l:conf_dict, 'remote_passwd')
-        let l:cmd = ['sshpass', '-p', l:sshpass_passwd] + l:cmd
+    " Prepare post-sync SSH command (up-syncs in remote mode only, not dry-runs)
+    let s:arsync_post_job_cmd = []
+    if (a:direction ==# 'up' || a:direction ==# 'upDelete')
+                \ && l:conf_dict['remote_or_local'] ==# 'remote'
+                \ && has_key(l:conf_dict, 'post_sync_cmd')
+                \ && !empty(l:conf_dict['post_sync_cmd'])
+        let l:user_at_host = (has_key(l:conf_dict, 'remote_user')
+                    \ ? l:conf_dict['remote_user'] . '@' : '') . l:conf_dict['remote_host']
+        let s:arsync_post_job_cmd = ['ssh', '-p', '' . l:conf_dict['remote_port'],
+                    \ l:user_at_host, l:conf_dict['post_sync_cmd']]
     endif
 
-    call setqflist([], ' ', {'title' : 'vim-arsync'})
-    let g:arsync_qfid = getqflist({'id' : 0}).id
-    let l:job_id = arsync#job#start(l:cmd, {
+    let s:arsync_is_dry_run = (a:direction ==# 'dryRun')
+    let g:arsync_status = 'syncing'
+    let l:title = s:arsync_is_dry_run ? 'vim-arsync [dry-run]' : 'vim-arsync'
+    call setqflist([], ' ', {'title' : l:title})
+    let s:arsync_qfid = getqflist({'id' : 0}).id
+    let s:arsync_running = 1
+    call arsync#job#start(l:cmd, {
                 \ 'on_stdout': function('JobHandler'),
                 \ 'on_stderr': function('JobHandler'),
-                \ 'on_exit': function('JobHandler'),
+                \ 'on_exit':   function('JobHandler'),
                 \ })
 endfunction
 
-function! AutoSync()
+" Run rsync with --dry-run --itemize-changes and open quickfix to show results.
+function! ARsyncDryRun() abort
+    call ARsync('dryRun')
+endfunction
+
+" SSH to the remote and display git log + status in the quickfix window.
+function! ARgitStatus() abort
+    let l:conf_dict = LoadConf()
+    if !has_key(l:conf_dict, 'remote_host')
+        if empty(findfile('.vim-arsync', '.;'))
+            echoerr 'vim-arsync: No .vim-arsync config file found. Aborting...'
+        else
+            echoerr 'vim-arsync: remote_host not configured. Aborting...'
+        endif
+        return
+    endif
+
+    let l:user_at_host = (has_key(l:conf_dict, 'remote_user')
+                \ ? l:conf_dict['remote_user'] . '@' : '') . l:conf_dict['remote_host']
+    let l:remote_path = l:conf_dict['remote_path']
+    let l:git_base = 'git -C ' . shellescape(l:remote_path)
+    let l:remote_shell_cmd = l:git_base . ' log --oneline -5 2>/dev/null'
+                \ . '; echo "---"'
+                \ . '; ' . l:git_base . ' status --short 2>/dev/null'
+    let l:ssh_cmd = ['ssh', '-p', '' . l:conf_dict['remote_port'],
+                \ l:user_at_host, l:remote_shell_cmd]
+
+    call setqflist([], ' ', {'title' : 'vim-arsync: git @ ' . l:user_at_host . ':' . l:remote_path})
+    let s:git_status_qfid = getqflist({'id' : 0}).id
+    call arsync#job#start(l:ssh_cmd, {
+                \ 'on_stdout': function('s:GitStatusHandler'),
+                \ 'on_stderr': function('s:GitStatusHandler'),
+                \ 'on_exit':   function('s:GitStatusHandler'),
+                \ })
+endfunction
+
+" Sync only the file currently open in the active buffer.
+function! ARsyncFile() abort
+    let l:conf_dict = LoadConf()
+    if l:conf_dict['remote_or_local'] ==# 'remote' && !has_key(l:conf_dict, 'remote_host')
+        if empty(findfile('.vim-arsync', '.;'))
+            echoerr 'vim-arsync: No .vim-arsync config file found. Aborting...'
+        else
+            echoerr 'vim-arsync: remote_host not configured. Aborting...'
+        endif
+        return
+    endif
+
+    if s:arsync_running
+        echo 'vim-arsync: sync already in progress, skipping.'
+        return
+    endif
+
+    let l:buf_path = expand('%:p')
+    if empty(l:buf_path) || !filereadable(l:buf_path)
+        echoerr 'vim-arsync: No readable file in current buffer.'
+        return
+    endif
+
+    let l:local_root  = substitute(l:conf_dict['local_path'], '/\+$', '', '')
+    if stridx(l:buf_path, l:local_root) != 0
+        echoerr 'vim-arsync: Current file is not under local_path. Aborting...'
+        return
+    endif
+
+    let l:rel_path    = substitute(l:buf_path[len(l:local_root):], '^/', '', '')
+    let l:remote_root = substitute(l:conf_dict['remote_path'], '/\+$', '', '')
+    let l:rel_dir     = fnamemodify(l:rel_path, ':h')
+    let l:remote_dir  = l:rel_dir ==# '.' ? l:remote_root : l:remote_root . '/' . l:rel_dir
+
+    let l:remote_opts = split(l:conf_dict['remote_options'])
+    let l:ssh_cmd     = 'ssh -p ' . l:conf_dict['remote_port']
+    let l:user_passwd = has_key(l:conf_dict, 'remote_user')
+                \ ? l:conf_dict['remote_user'] . '@' : ''
+
+    if l:conf_dict['remote_or_local'] ==# 'remote'
+        let l:dest = l:user_passwd . l:conf_dict['remote_host'] . ':' . l:remote_dir . '/'
+        let l:cmd = ['rsync'] + l:remote_opts + ['-e', l:ssh_cmd, l:buf_path, l:dest]
+    else
+        let l:cmd = ['rsync'] + split(l:conf_dict['local_options']) + [l:buf_path, l:remote_dir . '/']
+    endif
+
+    if has_key(l:conf_dict, 'remote_passwd')
+        let l:cmd = ['sshpass', '-p', l:conf_dict['remote_passwd']] + l:cmd
+    endif
+
+    let s:arsync_post_job_cmd = []
+    let s:arsync_is_dry_run   = 0
+    let g:arsync_status = 'syncing'
+    call setqflist([], ' ', {'title' : 'vim-arsync [file: ' . fnamemodify(l:buf_path, ':t') . ']'})
+    let s:arsync_qfid = getqflist({'id' : 0}).id
+    let s:arsync_running = 1
+    call arsync#job#start(l:cmd, {
+                \ 'on_stdout': function('JobHandler'),
+                \ 'on_stderr': function('JobHandler'),
+                \ 'on_exit':   function('JobHandler'),
+                \ })
+endfunction
+
+" Sync only the directory containing the file open in the active buffer.
+function! ARsyncDir() abort
+    let l:conf_dict = LoadConf()
+    if l:conf_dict['remote_or_local'] ==# 'remote' && !has_key(l:conf_dict, 'remote_host')
+        if empty(findfile('.vim-arsync', '.;'))
+            echoerr 'vim-arsync: No .vim-arsync config file found. Aborting...'
+        else
+            echoerr 'vim-arsync: remote_host not configured. Aborting...'
+        endif
+        return
+    endif
+
+    if s:arsync_running
+        echo 'vim-arsync: sync already in progress, skipping.'
+        return
+    endif
+
+    let l:buf_dir = expand('%:p:h')
+    if empty(l:buf_dir)
+        echoerr 'vim-arsync: Cannot determine current buffer directory.'
+        return
+    endif
+
+    let l:local_root = substitute(l:conf_dict['local_path'], '/\+$', '', '')
+    if stridx(l:buf_dir, l:local_root) != 0
+        echoerr 'vim-arsync: Current directory is not under local_path. Aborting...'
+        return
+    endif
+
+    let l:rel_dir     = substitute(l:buf_dir[len(l:local_root):], '^/', '', '')
+    let l:remote_root = substitute(l:conf_dict['remote_path'], '/\+$', '', '')
+    let l:remote_dir  = empty(l:rel_dir) ? l:remote_root : l:remote_root . '/' . l:rel_dir
+
+    let l:remote_opts = split(l:conf_dict['remote_options'])
+    let l:ssh_cmd     = 'ssh -p ' . l:conf_dict['remote_port']
+    let l:user_passwd = has_key(l:conf_dict, 'remote_user')
+                \ ? l:conf_dict['remote_user'] . '@' : ''
+
+    if l:conf_dict['remote_or_local'] ==# 'remote'
+        let l:dest = l:user_passwd . l:conf_dict['remote_host'] . ':' . l:remote_dir . '/'
+        let l:cmd = ['rsync'] + l:remote_opts + ['-e', l:ssh_cmd, l:buf_dir . '/', l:dest]
+    else
+        let l:cmd = ['rsync'] + split(l:conf_dict['local_options']) + [l:buf_dir . '/', l:remote_dir . '/']
+    endif
+
+    if has_key(l:conf_dict, 'remote_passwd')
+        let l:cmd = ['sshpass', '-p', l:conf_dict['remote_passwd']] + l:cmd
+    endif
+
+    let s:arsync_post_job_cmd = []
+    let s:arsync_is_dry_run   = 0
+    let g:arsync_status = 'syncing'
+    call setqflist([], ' ', {'title' : 'vim-arsync [dir: ' . fnamemodify(l:buf_dir, ':t') . ']'})
+    let s:arsync_qfid = getqflist({'id' : 0}).id
+    let s:arsync_running = 1
+    call arsync#job#start(l:cmd, {
+                \ 'on_stdout': function('JobHandler'),
+                \ 'on_stderr': function('JobHandler'),
+                \ 'on_exit':   function('JobHandler'),
+                \ })
+endfunction
+
+" Switch the active sync profile. Pass '' to revert to the default .vim-arsync.
+function! ARsyncProfile(name) abort
+    if empty(a:name)
+        let g:arsync_profile = ''
+        echo 'vim-arsync: Using default profile (.vim-arsync)'
+    else
+        if empty(findfile('.vim-arsync.' . a:name, '.;'))
+            echoerr 'vim-arsync: Profile file .vim-arsync.' . a:name . ' not found in this directory tree.'
+            return
+        endif
+        let g:arsync_profile = a:name
+        echo 'vim-arsync: Switched to profile "' . a:name . '" (.vim-arsync.' . a:name . ')'
+    endif
+    call AutoSync()
+endfunction
+
+" Debounced wrapper called by the BufWritePost autocmd when debounce_ms is set.
+function! s:DebouncedSync() abort
+    if s:arsync_debounce_timer != -1
+        call timer_stop(s:arsync_debounce_timer)
+    endif
+    let s:arsync_debounce_timer = timer_start(g:arsync_debounce_ms,
+                \ { -> execute("call ARsync('up')", '') })
+endfunction
+
+" Register (or clear) auto-sync autocmds for the current project.
+" Re-evaluated on VimEnter and DirChanged.
+function! AutoSync() abort
     " Always reset the auto-sync group first to prevent duplicate autocmds
     " when AutoSync() is called multiple times (VimEnter, DirChanged, etc.)
     augroup vimarsync_auto
@@ -171,7 +517,11 @@ function! AutoSync()
     let l:conf_dict = LoadConf()
     if has_key(l:conf_dict, 'auto_sync_up') && l:conf_dict['auto_sync_up'] == 1
         augroup vimarsync_auto
-            if has_key(l:conf_dict, 'sleep_before_sync') && l:conf_dict['sleep_before_sync'] > 0
+            if has_key(l:conf_dict, 'debounce_ms') && l:conf_dict['debounce_ms'] > 0
+                " debounce_ms: coalesce rapid saves — reset the timer on each write
+                let g:arsync_debounce_ms = l:conf_dict['debounce_ms']
+                autocmd BufWritePost,FileWritePost * call s:DebouncedSync()
+            elseif has_key(l:conf_dict, 'sleep_before_sync') && l:conf_dict['sleep_before_sync'] > 0
                 let g:arsync_sleep_time = l:conf_dict['sleep_before_sync'] * 1000
                 autocmd BufWritePost,FileWritePost * call timer_start(g:arsync_sleep_time, { -> execute("call ARsync('up')", "")})
             else
@@ -186,14 +536,19 @@ if !executable('rsync')
     finish
 endif
 
-command! ARsyncUp call ARsync('up')
-command! ARsyncUpDelete call ARsync('upDelete')
-command! ARsyncDown call ARsync('down')
-command! ARsyncDownDelete call ARsync('downDelete')
-command! ARshowConf call ShowConf()
+command! ARsyncUp          call ARsync('up')
+command! ARsyncUpDelete    call ARsync('upDelete')
+command! ARsyncDown        call ARsync('down')
+command! ARsyncDownDelete  call ARsync('downDelete')
+command! ARsyncDryRun      call ARsyncDryRun()
+command! ARsyncFile        call ARsyncFile()
+command! ARsyncDir         call ARsyncDir()
+command! ARgitStatus       call ARgitStatus()
+command! ARshowConf        call ShowConf()
+command! -nargs=1 ARsyncProfile call ARsyncProfile(<q-args>)
 
 augroup vimarsync
     autocmd!
-    autocmd VimEnter * call AutoSync()
+    autocmd VimEnter  * call AutoSync()
     autocmd DirChanged * call AutoSync()
 augroup END
