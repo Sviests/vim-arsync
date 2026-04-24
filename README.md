@@ -139,24 +139,61 @@ nnoremap <leader>sg :ARgitStatus<CR>
 
 ### Statusline integration
 
-The plugin updates two global variables after every sync:
+The plugin updates the following global variables after every sync:
 
 | Variable | Values |
 |---|---|
 | `g:arsync_status` | `''` (idle), `'syncing'`, `'ok'`, `'error'` |
-| `g:arsync_last_sync_time` | last successful sync time as `HH:MM:SS`, or `''` |
+| `g:arsync_status_detail` | Human-readable string combining direction symbol and target, e.g. `'↑ user@host'`, `'↓! user@host'`, `'~ user@host'`, `'↑ file.cpp'`. Empty when idle. |
+| `g:arsync_last_sync_time` | Last successful sync time as `HH:MM:SS`, or `''` |
 
-Example for **lualine**:
+After a sync completes (`'ok'` or `'error'`), the status automatically resets to `''` after
+`g:arsync_ok_duration` seconds (default: **5**). Set it in your vimrc to customise:
+
+```vim
+let g:arsync_ok_duration = 8   " show result for 8 s, then clear
+let g:arsync_ok_duration = 0   " never auto-clear
+```
+
+Direction symbols used in `g:arsync_status_detail`:
+
+| Symbol | Meaning |
+|---|---|
+| `↑` | Upload (`:ARsyncUp`, `:ARsyncFile`, `:ARsyncDir`) |
+| `↑!` | Upload + delete (`:ARsyncUpDelete`) |
+| `↓` | Download (`:ARsyncDown`) |
+| `↓!` | Download + delete (`:ARsyncDownDelete`) |
+| `~` | Dry-run preview (`:ARsyncDryRun`) |
+
+Example for **lualine** using `g:arsync_status_detail`:
 
 ```lua
 sections = {
   lualine_x = {
-    { function() return vim.g.arsync_status == 'syncing' and '⟳ syncing'
-                     or vim.g.arsync_status == 'ok'      and '✓ ' .. (vim.g.arsync_last_sync_time or '')
-                     or vim.g.arsync_status == 'error'   and '✗ sync error'
-                     or '' end },
+    { function()
+        local s = vim.g.arsync_status
+        local d = vim.g.arsync_status_detail or ''
+        if s == 'syncing' then return '⟳ ' .. d
+        elseif s == 'ok'  then return '✓ ' .. d
+        elseif s == 'error' then return '✗ ' .. d
+        else return '' end
+      end },
   },
 }
+```
+
+Example for a classic **Vim statusline**:
+
+```vim
+function! ArsyncStatusline() abort
+  let s = g:arsync_status
+  let d = g:arsync_status_detail
+  if s ==# 'syncing' | return '⟳ ' . d
+  elseif s ==# 'ok'  | return '✓ ' . d
+  elseif s ==# 'error' | return '✗ ' . d
+  else | return '' | endif
+endfunction
+set statusline+=\ %{ArsyncStatusline()}
 ```
 
 ### Multiple profiles

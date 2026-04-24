@@ -10,19 +10,66 @@ endif
 let g:loaded_vim_arsync = 1
 
 " ---------- Script-local state ----------
-let s:arsync_running        = 0   " concurrency guard
-let s:arsync_qfid           = 0   " quickfix list id for sync output
-let s:git_status_qfid       = 0   " quickfix list id for :ARgitStatus
-let s:arsync_debounce_timer = -1  " timer id for debounce
-let s:arsync_post_job_cmd   = []  " SSH command to run after a successful up-sync
-let s:arsync_is_dry_run     = 0   " 1 when the current job is a dry-run
+let s:arsync_running             = 0   " concurrency guard
+let s:arsync_qfid                = 0   " quickfix list id for sync output
+let s:git_status_qfid            = 0   " quickfix list id for :ARgitStatus
+let s:arsync_debounce_timer      = -1  " timer id for debounce
+let s:arsync_post_job_cmd        = []  " SSH command to run after a successful up-sync
+let s:arsync_is_dry_run          = 0   " 1 when the current job is a dry-run
+let s:arsync_direction_label     = ''  " direction symbol for g:arsync_status_detail
+let s:arsync_target_label        = ''  " target (host/file/dir) for g:arsync_status_detail
+let s:arsync_status_reset_timer  = -1  " timer id for auto-reset of ok/error status
 
 " Public variables for statusline / notification integration.
-" Possible values: '' (idle), 'syncing', 'ok', 'error'
+" g:arsync_status        — '' (idle), 'syncing', 'ok', 'error'
+" g:arsync_status_detail — human-readable string: direction symbol + target, e.g. '↑ user@host'
+" g:arsync_last_sync_time — last successful sync time as HH:MM:SS, or ''
+" g:arsync_ok_duration   — seconds before 'ok'/'error' auto-resets to '' (0 = never, default 5)
 let g:arsync_status         = ''
+let g:arsync_status_detail  = ''
 let g:arsync_last_sync_time = ''
+if !exists('g:arsync_ok_duration')
+    let g:arsync_ok_duration = 5
+endif
 
 " ---------- Helpers ----------
+
+" Resets the statusline state to idle; called by a timer after ok/error.
+function! s:ResetStatus(timer) abort
+    let s:arsync_status_reset_timer = -1
+    let g:arsync_status        = ''
+    let g:arsync_status_detail = ''
+    redrawstatus
+endfunction
+
+" Central status setter: updates g:arsync_status + g:arsync_status_detail,
+" fires redrawstatus, and schedules an auto-reset for ok/error states.
+function! s:SetStatus(status) abort
+    if s:arsync_status_reset_timer != -1
+        call timer_stop(s:arsync_status_reset_timer)
+        let s:arsync_status_reset_timer = -1
+    endif
+    let g:arsync_status = a:status
+    if a:status ==# 'syncing'
+        let g:arsync_status_detail = s:arsync_direction_label . s:arsync_target_label
+    elseif a:status ==# 'ok'
+        let g:arsync_last_sync_time = strftime('%H:%M:%S')
+        let g:arsync_status_detail  = s:arsync_direction_label . ' ' . g:arsync_last_sync_time
+        if g:arsync_ok_duration > 0
+            let s:arsync_status_reset_timer = timer_start(
+                        \ g:arsync_ok_duration * 1000, function('s:ResetStatus'))
+        endif
+    elseif a:status ==# 'error'
+        let g:arsync_status_detail = s:arsync_direction_label . ' error'
+        if g:arsync_ok_duration > 0
+            let s:arsync_status_reset_timer = timer_start(
+                        \ g:arsync_ok_duration * 1000, function('s:ResetStatus'))
+        endif
+    elseif a:status ==# ''
+        let g:arsync_status_detail = ''
+    endif
+    redrawstatus
+endfunction
 
 " Safe list parser — replaces eval() on ignore_path / include_path.
 " Accepts JSON-array syntax: ["a","b","c"]
@@ -176,15 +223,14 @@ function! JobHandler(job_id, data, event_type) abort
     elseif a:event_type ==# 'exit'
         let s:arsync_running = 0
         if a:data != 0
-            let g:arsync_status = 'error'
+            call s:SetStatus('error')
             copen
         elseif s:arsync_is_dry_run
-            let g:arsync_status = 'ok'
+            call s:SetStatus('ok')
             echo 'vim-arsync: dry-run completed — see quickfix for changes.'
             copen
         else
-            let g:arsync_status = 'ok'
-            let g:arsync_last_sync_time = strftime('%H:%M:%S')
+            call s:SetStatus('ok')
             if !empty(s:arsync_post_job_cmd)
                 call setqflist([], 'a', {'id' : s:arsync_qfid,
                             \ 'lines' : ['', '--- post_sync_cmd ---']})
@@ -303,11 +349,19 @@ function! ARsync(direction) abort
     endif
 
     let s:arsync_is_dry_run = (a:direction ==# 'dryRun')
-    let g:arsync_status = 'syncing'
+    let l:dir_symbols = {'up': '↑', 'down': '↓', 'upDelete': '↑!', 'downDelete': '↓!', 'dryRun': '~'}
+    let s:arsync_direction_label = get(l:dir_symbols, a:direction, a:direction)
+    if l:conf_dict['remote_or_local'] ==# 'remote' && has_key(l:conf_dict, 'remote_host')
+        let s:arsync_target_label = ' ' . (has_key(l:conf_dict, 'remote_user')
+                    \ ? l:conf_dict['remote_user'] . '@' : '') . l:conf_dict['remote_host']
+    else
+        let s:arsync_target_label = ''
+    endif
     let l:title = s:arsync_is_dry_run ? 'vim-arsync [dry-run]' : 'vim-arsync'
     call setqflist([], ' ', {'title' : l:title})
     let s:arsync_qfid = getqflist({'id' : 0}).id
     let s:arsync_running = 1
+    call s:SetStatus('syncing')
     call arsync#job#start(l:cmd, {
                 \ 'on_stdout': function('JobHandler'),
                 \ 'on_stderr': function('JobHandler'),
@@ -401,12 +455,14 @@ function! ARsyncFile() abort
         let l:cmd = ['sshpass', '-p', l:conf_dict['remote_passwd']] + l:cmd
     endif
 
-    let s:arsync_post_job_cmd = []
-    let s:arsync_is_dry_run   = 0
-    let g:arsync_status = 'syncing'
+    let s:arsync_post_job_cmd    = []
+    let s:arsync_is_dry_run      = 0
+    let s:arsync_direction_label = '↑'
+    let s:arsync_target_label    = ' ' . fnamemodify(l:buf_path, ':t')
     call setqflist([], ' ', {'title' : 'vim-arsync [file: ' . fnamemodify(l:buf_path, ':t') . ']'})
     let s:arsync_qfid = getqflist({'id' : 0}).id
     let s:arsync_running = 1
+    call s:SetStatus('syncing')
     call arsync#job#start(l:cmd, {
                 \ 'on_stdout': function('JobHandler'),
                 \ 'on_stderr': function('JobHandler'),
@@ -463,12 +519,14 @@ function! ARsyncDir() abort
         let l:cmd = ['sshpass', '-p', l:conf_dict['remote_passwd']] + l:cmd
     endif
 
-    let s:arsync_post_job_cmd = []
-    let s:arsync_is_dry_run   = 0
-    let g:arsync_status = 'syncing'
+    let s:arsync_post_job_cmd    = []
+    let s:arsync_is_dry_run      = 0
+    let s:arsync_direction_label = '↑'
+    let s:arsync_target_label    = ' ' . fnamemodify(l:buf_dir, ':t') . '/'
     call setqflist([], ' ', {'title' : 'vim-arsync [dir: ' . fnamemodify(l:buf_dir, ':t') . ']'})
     let s:arsync_qfid = getqflist({'id' : 0}).id
     let s:arsync_running = 1
+    call s:SetStatus('syncing')
     call arsync#job#start(l:cmd, {
                 \ 'on_stdout': function('JobHandler'),
                 \ 'on_stderr': function('JobHandler'),

@@ -47,7 +47,7 @@ vim-arsync/
 | `LoadConf()` | Parses `.vim-arsync` (or profile) config file (walks up from cwd), returns a dict. Handles comments (`#`), blank lines, list fields (`ignore_path`, `include_path`). Profile support via `g:arsync_profile`. |
 | `s:BuildRsyncCmd(dir, conf)` | Builds the rsync command list for any direction. Shared by `ARsync()` and `ShowConf()`. Applies all filters. |
 | `ARsync(direction)` | Entry point for `up`, `down`, `upDelete`, `downDelete`, `dryRun`. Checks concurrency guard, confirmation prompt, builds and dispatches job. |
-| `JobHandler(...)` | Callback for stdout/stderr/exit. Streams output to quickfix; opens on error or dry-run; updates `g:arsync_status`; triggers `s:PostSyncHandler` for post-sync cmds. |
+| `JobHandler(...)` | Callback for stdout/stderr/exit. Streams output to quickfix; opens on error or dry-run; calls `s:SetStatus()` to update statusline variables, trigger `redrawstatus`, and schedule auto-reset. |
 | `s:PostSyncHandler(...)` | Streams `post_sync_cmd` SSH output to quickfix, opens on error. |
 | `s:GitStatusHandler(...)` | Streams `ARgitStatus` output to its own quickfix list (`s:git_status_qfid`). |
 | `AutoSync()` | Registers (or clears) `BufWritePost`/`FileWritePost` autocmd. Supports `debounce_ms`, `sleep_before_sync`. Re-evaluated on `VimEnter` and `DirChanged`. |
@@ -137,6 +137,31 @@ Placed at the root of a project. Key fields:
 
 ---
 
+### Session 3 — 2026-04-24 (Statusline Improvements)
+
+**Goal:** Make the statusline integration more informative and fix the status not resetting after sync.
+
+**Root causes identified:**
+1. `redrawstatus` was never called → statusline never refreshed while Vim was idle
+2. `g:arsync_status` stayed at `'ok'`/`'error'` indefinitely — no auto-reset
+3. No direction or target info in the status (users couldn't tell what was syncing or where)
+
+**Changes made:**
+- `plugin/vim-arsync.vim`:
+  - Added `g:arsync_status_detail` — human-readable string with direction symbol + target
+    (e.g. `'↑ user@host'`, `'↓! user@host'`, `'↑ file.cpp'`, `'~ user@host'`)
+  - Added `g:arsync_ok_duration` — seconds before `'ok'`/`'error'` auto-resets to `''` (default: 5; set to 0 to disable)
+  - Added `s:SetStatus(status)` — central helper that updates both variables, calls `redrawstatus`, and schedules the reset timer
+  - Added `s:ResetStatus(timer)` — timer callback that clears status variables and calls `redrawstatus`
+  - `ARsync()`, `ARsyncFile()`, `ARsyncDir()` now set `s:arsync_direction_label` and `s:arsync_target_label` before starting the job
+  - All direct `let g:arsync_status = ...` assignments replaced with `call s:SetStatus(...)`
+- `README.md`:
+  - Expanded statusline section: new variables table, direction symbol table, `g:arsync_ok_duration` config docs
+  - Updated lualine example to use `g:arsync_status_detail`
+  - Added classic Vim statusline example
+
+---
+
 ## Improvement Roadmap
 
 Items are grouped by theme. ✅ = implemented.
@@ -167,6 +192,8 @@ Items are grouped by theme. ✅ = implemented.
 - ~~`eval()` is used to parse `ignore_path` / `include_path` list values~~ **Fixed** — replaced with `s:ParseList()` using `json_decode()`.
 - ~~No lock/guard against concurrent rsync jobs~~ **Fixed** — `s:arsync_running` flag.
 - ~~`g:arsync_qfid` global breaks with multiple projects in splits~~ **Fixed** — moved to `s:arsync_qfid` (script-local).
+- ~~`g:arsync_status` never resets after sync completes~~ **Fixed** — `s:SetStatus()` schedules a `timer_start` reset and calls `redrawstatus`.
+- ~~No direction or target information in the statusline~~ **Fixed** — `g:arsync_status_detail` carries direction symbol + target label.
 - Auto-sync group is fully replaced on every `DirChanged` / `VimEnter`, which means `g:arsync_debounce_ms` and `g:arsync_sleep_time` are still globals — if two projects use different values in a single session, the last `AutoSync()` call wins. Full per-project isolation would require keying state by `local_path`.
 
 ---
